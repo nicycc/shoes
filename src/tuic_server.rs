@@ -1412,6 +1412,7 @@ pub async fn start_tuic_server(
 
             Arc::get_mut(&mut server_config.transport)
                 .unwrap()
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()))
                 .max_concurrent_bidi_streams(4096_u32.into())
                 .max_concurrent_uni_streams(4096_u32.into())
                 .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))

@@ -40,6 +40,48 @@ fn default_mtu() -> u16 {
     return 1500;
 }
 
+fn default_fake_ip_range() -> String {
+    "198.18.0.0/16".to_string()
+}
+
+fn default_fake_ip_ttl() -> u32 {
+    60
+}
+
+/// Fake-IP DNS settings for TUN mode.
+///
+/// When enabled, shoes answers DNS A queries seen on the TUN interface with
+/// synthetic IPs from `range`. Connections to those synthetic IPs are translated
+/// back to the queried domain before routing rules are evaluated.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TunFakeIpConfig {
+    /// Enable fake-IP DNS handling.
+    pub enabled: bool,
+
+    /// IPv4 CIDR used for synthetic DNS answers.
+    pub range: String,
+
+    /// DNS answer TTL in seconds.
+    pub ttl: u32,
+}
+
+impl Default for TunFakeIpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            range: default_fake_ip_range(),
+            ttl: default_fake_ip_ttl(),
+        }
+    }
+}
+
+impl TunFakeIpConfig {
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
+    }
+}
+
 /// TUN device server configuration.
 ///
 /// This is a top-level config type (not nested under ServerConfig) because TUN
@@ -111,4 +153,8 @@ pub struct TunConfig {
     /// Can reference a dns_group by name or specify inline DNS servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<DnsConfig>,
+
+    /// Fake-IP DNS handling for domain-based TUN routing.
+    #[serde(default, skip_serializing_if = "TunFakeIpConfig::is_disabled")]
+    pub fake_ip: TunFakeIpConfig,
 }

@@ -9,6 +9,7 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -16,6 +17,8 @@ use etherparse::PacketBuilder;
 use futures::{Sink, Stream, ready};
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, UdpPacket};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+use super::fake_dns::FakeDns;
 
 pub type PacketBuffer = Vec<u8>;
 
@@ -28,6 +31,10 @@ pub struct UdpHandler {
     from_tun_rx: UnboundedReceiver<PacketBuffer>,
     /// Sender for UDP packets to TUN
     to_tun_tx: UnboundedSender<PacketBuffer>,
+    /// Optional fake DNS responder.
+    fake_dns: Option<Arc<FakeDns>>,
+    /// Whether non-DNS UDP packets should be forwarded to the UDP manager.
+    forward_udp: bool,
 }
 
 impl UdpHandler {
@@ -35,10 +42,14 @@ impl UdpHandler {
     pub fn new(
         from_tun_rx: UnboundedReceiver<PacketBuffer>,
         to_tun_tx: UnboundedSender<PacketBuffer>,
+        fake_dns: Option<Arc<FakeDns>>,
+        forward_udp: bool,
     ) -> Self {
         Self {
             from_tun_rx,
             to_tun_tx,
+            fake_dns,
+            forward_udp,
         }
     }
 
@@ -47,6 +58,9 @@ impl UdpHandler {
         (
             UdpReader {
                 from_tun_rx: self.from_tun_rx,
+                to_tun_tx: self.to_tun_tx.clone(),
+                fake_dns: self.fake_dns,
+                forward_udp: self.forward_udp,
             },
             UdpWriter {
                 to_tun_tx: self.to_tun_tx,
@@ -58,6 +72,9 @@ impl UdpHandler {
 /// Read half for receiving UDP packets.
 pub struct UdpReader {
     from_tun_rx: UnboundedReceiver<PacketBuffer>,
+    to_tun_tx: UnboundedSender<PacketBuffer>,
+    fake_dns: Option<Arc<FakeDns>>,
+    forward_udp: bool,
 }
 
 /// Write half for sending UDP packets.
@@ -85,6 +102,26 @@ impl Stream for UdpReader {
             match ready!(self.from_tun_rx.poll_recv(cx)) {
                 Some(packet) => {
                     if let Some(msg) = parse_udp_packet(&packet) {
+                        let (payload, src_addr, dst_addr) = &msg;
+                        if dst_addr.port() == 53
+                            && let Some(fake_dns) = &self.fake_dns
+                            && let Some(response) = fake_dns.handle_dns_query(payload)
+                        {
+                            match build_udp_packet(&response, *dst_addr, *src_addr) {
+                                Ok(packet) => {
+                                    let _ = self.to_tun_tx.send(packet);
+                                }
+                                Err(e) => {
+                                    log::debug!("failed to build fake DNS response: {}", e);
+                                }
+                            }
+                            continue;
+                        }
+
+                        if !self.forward_udp {
+                            continue;
+                        }
+
                         return Poll::Ready(Some(msg));
                     }
                     // Invalid packet, try next

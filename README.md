@@ -249,6 +249,10 @@ See the [examples](./examples) directory for all examples.
   mtu: 1500
   tcp_enabled: true
   udp_enabled: true
+  fake_ip:
+    enabled: true
+    range: 198.18.0.0/16
+    ttl: 60
   rules:
     - masks: "0.0.0.0/0"
       action: allow

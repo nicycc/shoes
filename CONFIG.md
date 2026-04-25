@@ -313,6 +313,12 @@ tcp_enabled: true              # Default: true
 udp_enabled: true              # Default: true
 icmp_enabled: true             # Default: true
 
+# Fake-IP DNS for domain-based TUN routing
+fake_ip:
+  enabled: false               # Default: false
+  range: "198.18.0.0/16"       # Synthetic IPv4 pool
+  ttl: 60                      # DNS answer TTL in seconds
+
 # Routing rules
 rules: [RuleConfig]
 ```
@@ -321,6 +327,9 @@ rules: [RuleConfig]
 - **Linux**: Requires root or `CAP_NET_ADMIN`. Creates device with specified name/address.
 - **Android**: Use `device_fd` from `VpnService.Builder.establish()`. Routes configured via VpnService.
 - **iOS**: Use `device_fd` from `NEPacketTunnelProvider.packetFlow`.
+- **Fake-IP**: When enabled, TUN answers UDP/53 A queries with fake IPv4 addresses
+  and routes TCP/UDP connections to those addresses by the original queried domain.
+  This is useful for domain rules such as `youtube.com` in transparent TUN mode.
 
 **Example (Linux):**
 ```yaml

@@ -29,6 +29,7 @@
 //!   directly, or `false` if using the readPackets/writePackets API.
 
 mod tcp_conn;
+mod fake_dns;
 mod tcp_stack_direct;
 mod tun_server;
 mod udp_handler;
@@ -58,9 +59,10 @@ use crate::address::{Address, NetLocation};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::TunConfig;
 use crate::config::selection::ConfigSelection;
-use crate::resolver::{NativeResolver, Resolver};
+use crate::resolver::Resolver;
 use crate::tcp::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
+use fake_dns::FakeDns;
 use tcp_stack_direct::{NewTcpConnection, TcpStackDirect};
 use udp_manager::TunUdpManager;
 
@@ -78,6 +80,16 @@ pub async fn run_tun_server(
     config: TunServerConfig,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    run_tun_server_inner(config, proxy_selector, resolver, None, shutdown_rx).await
+}
+
+async fn run_tun_server_inner(
+    config: TunServerConfig,
+    proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+    fake_dns: Option<Arc<FakeDns>>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     info!(
@@ -113,6 +125,7 @@ pub async fn run_tun_server(
     let tcp_task: Option<JoinHandle<()>> = if config.tcp_enabled {
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
+        let fake_dns = fake_dns.clone();
 
         Some(tokio::spawn(async move {
             info!("Starting TCP connection handler");
@@ -120,10 +133,11 @@ pub async fn run_tun_server(
             while let Some(new_conn) = tcp_conn_rx.recv().await {
                 let proxy_selector = proxy_selector.clone();
                 let resolver = resolver.clone();
+                let fake_dns = fake_dns.clone();
 
                 tokio::spawn(async move {
                     let remote_addr = new_conn.remote_addr;
-                    let target = socket_addr_to_net_location(remote_addr);
+                    let target = socket_addr_to_net_location(remote_addr, fake_dns.as_deref());
 
                     debug!("Handling TCP connection to {:?}", target);
 
@@ -142,12 +156,22 @@ pub async fn run_tun_server(
         None
     };
 
-    let udp_task = if config.udp_enabled {
+    let udp_task = if config.udp_enabled || fake_dns.is_some() {
         let proxy_selector = proxy_selector.clone();
         let resolver = resolver.clone();
+        let fake_dns = fake_dns.clone();
+        let forward_udp = config.udp_enabled;
 
         Some(tokio::spawn(async move {
-            handle_udp_packets(udp_from_stack_rx, udp_to_stack_tx, proxy_selector, resolver).await;
+            handle_udp_packets(
+                udp_from_stack_rx,
+                udp_to_stack_tx,
+                proxy_selector,
+                resolver,
+                fake_dns,
+                forward_udp,
+            )
+            .await;
         }))
     } else {
         None
@@ -184,7 +208,13 @@ pub async fn run_tun_server(
 }
 
 /// Convert a SocketAddr to a NetLocation.
-fn socket_addr_to_net_location(addr: SocketAddr) -> NetLocation {
+fn socket_addr_to_net_location(addr: SocketAddr, fake_dns: Option<&FakeDns>) -> NetLocation {
+    if let Some(fake_dns) = fake_dns
+        && let Some(domain) = fake_dns.lookup_ip(addr.ip())
+    {
+        return NetLocation::new(Address::Hostname(domain), addr.port());
+    }
+
     let address = match addr.ip() {
         std::net::IpAddr::V4(v4) => Address::Ipv4(v4),
         std::net::IpAddr::V6(v6) => Address::Ipv6(v6),
@@ -268,13 +298,16 @@ async fn handle_udp_packets(
     to_stack_tx: mpsc::UnboundedSender<PacketBuffer>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    fake_dns: Option<Arc<FakeDns>>,
+    forward_udp: bool,
 ) {
     info!("Starting UDP handler (session-based)");
 
-    let udp_handler = udp_handler::UdpHandler::new(from_stack_rx, to_stack_tx);
+    let udp_handler =
+        udp_handler::UdpHandler::new(from_stack_rx, to_stack_tx, fake_dns.clone(), forward_udp);
     let (reader, writer) = udp_handler.split();
 
-    let manager = TunUdpManager::new(reader, writer, proxy_selector, resolver);
+    let manager = TunUdpManager::new(reader, writer, proxy_selector, resolver, fake_dns);
 
     if let Err(e) = manager.run().await {
         warn!("UDP handler error: {}", e);
@@ -286,13 +319,13 @@ async fn handle_udp_packets(
 /// Start TUN server based on the provided configuration.
 pub async fn start_tun_server(
     config: TunConfig,
-    _resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
+    resolver: std::sync::Arc<dyn crate::resolver::Resolver>,
 ) -> std::io::Result<JoinHandle<()>> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let handle = tokio::spawn(async move {
         let _keep_alive = shutdown_tx;
-        if let Err(e) = run_tun_from_config(config, shutdown_rx, true).await {
+        if let Err(e) = run_tun_from_config(config, resolver, shutdown_rx, true).await {
             warn!("TUN server error: {}", e);
         }
     });
@@ -303,6 +336,7 @@ pub async fn start_tun_server(
 /// Run TUN server from config with external shutdown control.
 pub async fn run_tun_from_config(
     config: TunConfig,
+    resolver: Arc<dyn Resolver>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     close_fd_on_drop: bool,
 ) -> std::io::Result<()> {
@@ -335,14 +369,25 @@ pub async fn run_tun_from_config(
         tun_server_config = tun_server_config.destination(dest);
     }
 
+    let fake_dns = if config.fake_ip.enabled {
+        let fake_dns = FakeDns::new(&config.fake_ip.range, config.fake_ip.ttl)?;
+        info!(
+            "TUN fake-ip DNS enabled: range={}, ttl={}",
+            config.fake_ip.range, config.fake_ip.ttl
+        );
+        Some(Arc::new(fake_dns))
+    } else {
+        None
+    };
+
     let rules = config.rules.map(ConfigSelection::unwrap_config).into_vec();
-    let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
     let client_proxy_selector = Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()));
 
-    run_tun_server(
+    run_tun_server_inner(
         tun_server_config,
         client_proxy_selector,
         resolver,
+        fake_dns,
         shutdown_rx,
     )
     .await

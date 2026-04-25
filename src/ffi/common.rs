@@ -194,9 +194,11 @@ pub async fn start_from_config(
         join_handles.extend(start_servers(Config::Server(server_config), resolver).await?);
     }
 
+    let tun_resolver = dns_registry.get_for_server(tun_config.dns.as_ref());
+
     // Run TUN server (blocks until shutdown). close_fd_on_drop = false because mobile owns the FD
     #[cfg(unix)]
-    let result = run_tun_from_config(tun_config, shutdown_rx, false).await;
+    let result = run_tun_from_config(tun_config, tun_resolver, shutdown_rx, false).await;
     #[cfg(not(unix))]
     let result = Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

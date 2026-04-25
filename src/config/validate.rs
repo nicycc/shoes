@@ -1274,6 +1274,16 @@ fn validate_tun_config(
         }
     }
 
+    if config.fake_ip.enabled {
+        validate_fake_ip_range(&config.fake_ip.range)?;
+        if config.fake_ip.ttl == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "TUN fake_ip ttl must be greater than 0",
+            ));
+        }
+    }
+
     // Resolve rule group references
     ConfigSelection::replace_none_or_some_groups(&mut config.rules, rule_groups)?;
 
@@ -1283,6 +1293,34 @@ fn validate_tun_config(
         validate_rule_config(rule, client_groups, &HashMap::new())?;
     }
 
+    Ok(())
+}
+
+fn validate_fake_ip_range(range: &str) -> std::io::Result<()> {
+    let (addr, prefix) = range.split_once('/').ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TUN fake_ip range must be IPv4 CIDR, for example 198.18.0.0/16",
+        )
+    })?;
+    let _ = addr.parse::<std::net::Ipv4Addr>().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("TUN fake_ip range has invalid IPv4 address: {e}"),
+        )
+    })?;
+    let prefix = prefix.parse::<u8>().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("TUN fake_ip range has invalid prefix: {e}"),
+        )
+    })?;
+    if prefix == 0 || prefix > 32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TUN fake_ip range prefix must be between 1 and 32",
+        ));
+    }
     Ok(())
 }
 
@@ -2031,6 +2069,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tun_fake_ip_config_parsing() {
+        let yaml = r#"
+- device_name: "tun0"
+  address: "10.0.0.1"
+  fake_ip:
+    enabled: true
+    range: "198.18.0.0/16"
+    ttl: 120
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        protocol:
+          type: direct
+"#;
+        let configs: Vec<Config> = serde_yaml::from_str(yaml).unwrap();
+        match &configs[0] {
+            Config::TunServer(tun) => {
+                assert!(tun.fake_ip.enabled);
+                assert_eq!(tun.fake_ip.range, "198.18.0.0/16");
+                assert_eq!(tun.fake_ip.ttl, 120);
+            }
+            _ => panic!("Expected TunServer config"),
+        }
+
+        let result = validate_configs_test(configs).await;
+        assert!(result.is_ok(), "TUN fake_ip validation failed: {:?}", result);
+    }
+
+    #[tokio::test]
     async fn test_tun_icmp_requires_tcp() {
         // ICMP requires TCP to be enabled
         let tun_config = TunConfig {
@@ -2045,6 +2113,7 @@ mod tests {
             icmp_enabled: true, // but ICMP enabled - should fail
             rules: NoneOrSome::Unspecified,
             dns: None,
+            fake_ip: Default::default(),
         };
 
         let configs = vec![Config::TunServer(tun_config)];

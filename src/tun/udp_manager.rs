@@ -26,6 +26,7 @@ use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::resolver::Resolver;
 
 use super::udp_handler::{UdpMessage, UdpReader, UdpWriter};
+use super::fake_dns::FakeDns;
 
 /// Session timeout - sessions without activity are expired
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
@@ -49,7 +50,13 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Convert a SocketAddr to a NetLocation.
-fn socket_addr_to_net_location(addr: SocketAddr) -> NetLocation {
+fn socket_addr_to_net_location(addr: SocketAddr, fake_dns: Option<&FakeDns>) -> NetLocation {
+    if let Some(fake_dns) = fake_dns
+        && let Some(domain) = fake_dns.lookup_ip(addr.ip())
+    {
+        return NetLocation::new(Address::Hostname(domain), addr.port());
+    }
+
     let address = match addr.ip() {
         std::net::IpAddr::V4(v4) => Address::Ipv4(v4),
         std::net::IpAddr::V6(v6) => Address::Ipv6(v6),
@@ -67,6 +74,7 @@ pub struct TunUdpManager {
     sessions: LruCache<SocketAddr, Session>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    fake_dns: Option<Arc<FakeDns>>,
     /// Receives responses from destination tasks (across all sessions)
     response_rx: mpsc::Receiver<UdpMessage>,
     /// Cloned into each session, then into each destination task
@@ -96,6 +104,7 @@ impl TunUdpManager {
         writer: UdpWriter,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
+        fake_dns: Option<Arc<FakeDns>>,
     ) -> Self {
         let (response_tx, response_rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
@@ -105,6 +114,7 @@ impl TunUdpManager {
             sessions: LruCache::new(NonZeroUsize::new(MAX_SESSIONS).unwrap()),
             proxy_selector,
             resolver,
+            fake_dns,
             response_rx,
             response_tx,
         }
@@ -224,6 +234,7 @@ impl TunUdpManager {
             self.response_tx.clone(),
             self.proxy_selector.clone(),
             self.resolver.clone(),
+            self.fake_dns.clone(),
         ));
 
         let session = Session {
@@ -300,6 +311,7 @@ async fn session_task(
     response_tx: mpsc::Sender<UdpMessage>,
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
+    fake_dns: Option<Arc<FakeDns>>,
 ) {
     debug!("[TunUdpSession {}] Starting", peer_addr);
 
@@ -314,7 +326,7 @@ async fn session_task(
                     break;
                 };
 
-                let dest = socket_addr_to_net_location(dest_addr);
+                let dest = socket_addr_to_net_location(dest_addr, fake_dns.as_deref());
 
                 // Remove dead destination entry so we recreate below
                 if let Some(entry) = destinations.get(&dest)
@@ -331,15 +343,10 @@ async fn session_task(
                 if !destinations.contains_key(&dest) {
                     match create_connection(&dest, &proxy_selector, &resolver).await {
                         Ok(stream) => {
-                            let source_addr = match dest.to_socket_addr_nonblocking() {
-                                Some(addr) => addr,
-                                None => continue,
-                            };
-
                             let (write_tx, write_rx) = mpsc::channel(CHANNEL_SIZE);
                             let handle = tokio::spawn(destination_task(
                                 peer_addr,
-                                source_addr,
+                                dest_addr,
                                 stream,
                                 write_rx,
                                 response_tx.clone(),
